@@ -1,4 +1,6 @@
 import { PointerEvent, useRef, useState } from 'react'
+import { isTauri } from '@tauri-apps/api/core'
+import { getCurrentWindow } from '@tauri-apps/api/window'
 
 const allowance = 78
 
@@ -8,6 +10,7 @@ export function App() {
   const [dragging, setDragging] = useState(false)
   const dragStart = useRef({ x: 0, y: 0, left: 0, top: 0 })
   const moved = useRef(false)
+  const nativeDragStarted = useRef(false)
 
   const handlePointerDown = (event: PointerEvent<HTMLDivElement>) => {
     event.currentTarget.setPointerCapture(event.pointerId)
@@ -23,11 +26,17 @@ export function App() {
     if (Math.abs(event.clientX - dragStart.current.x) > 3 || Math.abs(event.clientY - dragStart.current.y) > 3) {
       moved.current = true
     }
+    if (moved.current && isTauri() && !nativeDragStarted.current) {
+      nativeDragStarted.current = true
+      void getCurrentWindow().startDragging()
+      return
+    }
     setPosition({ x: nextX, y: nextY })
   }
 
   const handlePointerUp = () => {
     setDragging(false)
+    nativeDragStarted.current = false
     if (!moved.current) setExpanded((value) => !value)
   }
 
