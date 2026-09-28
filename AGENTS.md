@@ -11,14 +11,14 @@
 
 ## 推荐技术边界
 
-- 桌面壳：Tauri 2
-- 前端：React + TypeScript + Vite
-- 原生后端：Rust
+- 桌面程序：Rust + Win32 API 原生窗口
+- 绘制：Windows GDI，直接生成 Windows GUI EXE
+- 不使用 WebView、浏览器窗口、React 或本地 HTTP 服务
 - Codex 通信：优先复用 Codex Tracker 的 `codex app-server --stdio` JSON-RPC 方案，通过已安装的 Codex CLI 获取 allowance 数据。
 - 不读取、解析或复制 Codex 本地认证文件；认证应继续由 Codex 官方流程和系统浏览器管理。
 - Windows 是第一目标平台；最终交付使用 Tauri Windows installer/exe。
 
-除非后续有明确理由，不要引入 Electron 或自建 HTTP 服务来替代上述边界。参考项目：<https://github.com/heavymaskstudio/Codex-Tracker>。
+除非后续有明确理由，不要引入 Tauri、Electron、WebView 或自建 HTTP 服务来替代上述边界。参考项目：<https://github.com/heavymaskstudio/Codex-Tracker>。
 
 ## 设计与行为约束
 
@@ -35,8 +35,7 @@
 
 保持职责清晰：
 
-- `src/`：React 展示、交互、格式化和视图状态
-- `src-tauri/`：Rust 原生窗口/托盘、Codex 子进程监督、JSON-RPC、通知和持久化设置
+- `src-tauri/src/`：Rust 原生窗口/托盘、GDI 绘制、Codex 子进程监督、JSON-RPC、通知和持久化设置
 - `tests/` 或前端邻近测试目录：额度解析、状态转换和关键 UI 行为
 - `artifacts/`：构建产物；不要提交生成的安装包
 
@@ -47,12 +46,8 @@
 项目初始化后，优先提供并使用以下命令；若 `package.json` 中已有不同命令，以实际脚本为准：
 
 ```powershell
-npm.cmd install
-npm.cmd test
-npm.cmd run build
 cargo check --manifest-path src-tauri\Cargo.toml
-npm.cmd run tauri dev
-npm.cmd run build:exe
+cargo build --release --manifest-path src-tauri\Cargo.toml
 ```
 
 涉及真实 Codex 通信时，同时保留不依赖登录态的协议/响应样例测试；UI 测试不要把网络或本机 Codex 进程作为唯一数据源。Windows 发布前验证 WebView2、安装包启动、托盘菜单、置顶/拖动、登录缺失和断线恢复。
@@ -61,7 +56,7 @@ npm.cmd run build:exe
 
 1. 先确认 Codex CLI 的可执行文件发现、`app-server` 启动和 JSON-RPC 响应形状，再设计领域类型。
 2. 先写 allowance 映射与状态机测试，再接入悬浮球视图。
-3. 原生能力优先放 Rust；React 只负责展示和用户交互。
+3. 所有窗口、绘制和原生能力放 Rust；不引入前端运行时。
 4. 每次改动保持小范围，并运行受影响的最窄测试；完成前至少运行前端构建和 Rust 检查。
 5. 美术方案确定后再扩展主题、动效和素材，不要在数据链路未稳定时大规模改视觉。
 
