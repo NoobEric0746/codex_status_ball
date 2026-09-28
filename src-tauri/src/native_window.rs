@@ -5,6 +5,7 @@ use std::io::{BufRead, BufReader, Write};
 use std::path::PathBuf;
 use std::ptr::{null, null_mut};
 use std::process::{ChildStdin, ChildStdout, Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde_json::{json, Value};
@@ -25,6 +26,10 @@ const WINDOW_TITLE: &[u16] = &[67, 111, 100, 101, 120, 32, 83, 116, 97, 116, 117
 const WM_PAINT: u32 = 0x000F;
 const WM_DESTROY: u32 = 0x0002;
 const WM_NCHITTEST: u32 = 0x0084;
+const WM_NCMOUSEMOVE: u32 = 0x00A0;
+const WM_MOUSEMOVE: u32 = 0x0200;
+const WM_NCMOUSELEAVE: u32 = 0x02A2;
+const WM_MOUSELEAVE: u32 = 0x02A3;
 const HTCAPTION: Lresult = 2;
 const WS_POPUP: u32 = 0x80000000;
 const WS_EX_TOPMOST: u32 = 0x00000008;
@@ -42,8 +47,10 @@ const PS_SOLID: i32 = 0;
 const AD_CLOCKWISE: i32 = 2;
 const HALFTONE: i32 = 4;
 const SCALE: i32 = 4;
-const DESIGN_SIZE: i32 = 174;
-const WINDOW_SIZE: i32 = 122;
+const BALL_SIZE: i32 = 122;
+const PANEL_WIDTH: i32 = 236;
+const WINDOW_WIDTH: i32 = BALL_SIZE + PANEL_WIDTH;
+const WINDOW_HEIGHT: i32 = BALL_SIZE;
 
 #[repr(C)]
 struct Point { x: i32, y: i32 }
@@ -57,7 +64,12 @@ struct Msg { hwnd: Hwnd, message: u32, w_param: Wparam, l_param: Lparam, time: u
 #[repr(C)]
 struct PaintStruct { hdc: Hdc, erase: i32, paint: Rect, reserved: i32 }
 
+#[repr(C)]
+struct TrackMouseEvent { size: u32, flags: u32, hwnd: Hwnd, hover_time: u32 }
+
 type WindowProc = unsafe extern "system" fn(Hwnd, u32, Wparam, Lparam) -> Lresult;
+
+static HOVERED: AtomicBool = AtomicBool::new(false);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct AllowanceSnapshot {
@@ -96,11 +108,13 @@ unsafe extern "system" {
     fn GetMessageW(message: *mut Msg, hwnd: Hwnd, min: u32, max: u32) -> i32;
     fn GetModuleHandleW(name: *const u16) -> Hinstance;
     fn GetSystemMetrics(index: i32) -> i32;
+    fn InvalidateRect(hwnd: Hwnd, rect: *const Rect, erase: i32) -> i32;
     fn RegisterClassW(class: *const WndClass) -> u16;
     fn SetWindowPos(hwnd: Hwnd, insert_after: Hwnd, x: i32, y: i32, width: i32, height: i32, flags: u32) -> i32;
     fn SetWindowRgn(hwnd: Hwnd, region: Hregion, redraw: i32) -> i32;
     fn SetProcessDPIAware() -> i32;
     fn ShowWindow(hwnd: Hwnd, command: i32) -> i32;
+    fn TrackMouseEvent(event: *mut TrackMouseEvent) -> i32;
     fn TranslateMessage(message: *const Msg) -> i32;
     fn PostQuitMessage(exit_code: i32);
 }
@@ -119,6 +133,7 @@ unsafe extern "system" {
     fn CreateCompatibleBitmap(hdc: Hdc, width: i32, height: i32) -> Handle;
     fn CreateCompatibleDC(hdc: Hdc) -> Hdc;
     fn DeleteDC(hdc: Hdc) -> i32;
+    fn CreateRoundRectRgn(left: i32, top: i32, right: i32, bottom: i32, width: i32, height: i32) -> Hregion;
     fn SetStretchBltMode(hdc: Hdc, mode: i32) -> i32;
     fn StretchBlt(destination: Hdc, x: i32, y: i32, width: i32, height: i32, source: Hdc, source_x: i32, source_y: i32, source_width: i32, source_height: i32, operation: u32) -> i32;
     fn SelectObject(hdc: Hdc, object: Handle) -> Handle;
@@ -130,6 +145,22 @@ unsafe extern "system" {
 unsafe extern "system" fn window_proc(hwnd: Hwnd, message: u32, w_param: Wparam, l_param: Lparam) -> Lresult {
     match message {
         WM_NCHITTEST => HTCAPTION,
+        WM_MOUSEMOVE | WM_NCMOUSEMOVE => {
+            if !HOVERED.swap(true, Ordering::Relaxed) {
+                set_window_region(hwnd, true);
+                InvalidateRect(hwnd, null(), 0);
+            }
+            let flags = if message == WM_NCMOUSEMOVE { 0x12 } else { 2 };
+            let mut tracking = TrackMouseEvent { size: std::mem::size_of::<TrackMouseEvent>() as u32, flags, hwnd, hover_time: 0 };
+            TrackMouseEvent(&mut tracking);
+            0
+        }
+        WM_MOUSELEAVE | WM_NCMOUSELEAVE => {
+            HOVERED.store(false, Ordering::Relaxed);
+            set_window_region(hwnd, false);
+            InvalidateRect(hwnd, null(), 0);
+            0
+        }
         WM_PAINT => 0,
         WM_DESTROY => {
             PostQuitMessage(0);
@@ -139,59 +170,92 @@ unsafe extern "system" fn window_proc(hwnd: Hwnd, message: u32, w_param: Wparam,
     }
 }
 
+unsafe fn set_window_region(hwnd: Hwnd, expanded: bool) {
+    let region = if expanded {
+        CreateRoundRectRgn(0, 0, WINDOW_WIDTH, WINDOW_HEIGHT, WINDOW_HEIGHT, WINDOW_HEIGHT)
+    } else {
+        CreateEllipticRgn(0, 0, BALL_SIZE, BALL_SIZE)
+    };
+    SetWindowRgn(hwnd, region, 1);
+}
+
 unsafe fn paint_window(hwnd: Hwnd, snapshot: &AllowanceSnapshot) {
     let allowance = snapshot.five_hour.remaining_percent;
+    let hovered = HOVERED.load(Ordering::Relaxed);
     let mut paint = PaintStruct { hdc: null_mut(), erase: 0, paint: Rect { left: 0, top: 0, right: 0, bottom: 0 }, reserved: 0 };
     let hdc = BeginPaint(hwnd, &mut paint);
-    let large_size = DESIGN_SIZE * SCALE;
+    let large_width = WINDOW_WIDTH * SCALE;
+    let large_height = WINDOW_HEIGHT * SCALE;
     let buffer = CreateCompatibleDC(hdc);
-    let bitmap = CreateCompatibleBitmap(hdc, large_size, large_size);
+    let bitmap = CreateCompatibleBitmap(hdc, large_width, large_height);
     let previous_bitmap = SelectObject(buffer, bitmap);
-    let bounds = Rect { left: 0, top: 0, right: large_size, bottom: large_size };
+    let bounds = Rect { left: 0, top: 0, right: large_width, bottom: large_height };
     let background = CreateSolidBrush(rgb(27, 42, 41));
     FillRect(buffer, &bounds, background);
     DeleteObject(background);
 
-    let ball_brush = CreateSolidBrush(rgb(36, 63, 60));
+    if hovered {
+        let panel_brush = CreateSolidBrush(rgb(23, 47, 48));
+        let panel = Rect { left: BALL_SIZE * SCALE, top: 0, right: WINDOW_WIDTH * SCALE, bottom: WINDOW_HEIGHT * SCALE };
+        FillRect(buffer, &panel, panel_brush);
+        DeleteObject(panel_brush);
+    }
+
+    let ball_brush = CreateSolidBrush(rgb(41, 71, 67));
     SelectObject(buffer, ball_brush);
-    Ellipse(buffer, 8 * SCALE, 8 * SCALE, 166 * SCALE, 166 * SCALE);
+    Ellipse(buffer, 6 * SCALE, 6 * SCALE, 116 * SCALE, 116 * SCALE);
     DeleteObject(ball_brush);
 
     let track_pen = CreatePen(PS_SOLID, 5 * SCALE, rgb(80, 108, 102));
     SelectObject(buffer, track_pen);
     SetArcDirection(buffer, AD_CLOCKWISE);
-    Arc(buffer, 15 * SCALE, 15 * SCALE, 159 * SCALE, 159 * SCALE, 87 * SCALE, 15 * SCALE, 87 * SCALE, 15 * SCALE);
+    Arc(buffer, 5 * SCALE, 5 * SCALE, 117 * SCALE, 117 * SCALE, 61 * SCALE, 5 * SCALE, 61 * SCALE, 5 * SCALE);
     DeleteObject(track_pen);
 
     let progress_pen = CreatePen(PS_SOLID, 5 * SCALE, rgb(154, 226, 180));
     SelectObject(buffer, progress_pen);
     let end_angle = 2.0 * std::f64::consts::PI * (allowance as f64 / 100.0) - std::f64::consts::FRAC_PI_2;
-    let end_x = 87.0 + 72.0 * end_angle.cos();
-    let end_y = 87.0 + 72.0 * end_angle.sin();
-    Arc(buffer, 15 * SCALE, 15 * SCALE, 159 * SCALE, 159 * SCALE, 87 * SCALE, 15 * SCALE, (end_x * SCALE as f64).round() as i32, (end_y * SCALE as f64).round() as i32);
+    let end_x = 61.0 + 56.0 * end_angle.cos();
+    let end_y = 61.0 + 56.0 * end_angle.sin();
+    Arc(buffer, 5 * SCALE, 5 * SCALE, 117 * SCALE, 117 * SCALE, 61 * SCALE, 5 * SCALE, (end_x * SCALE as f64).round() as i32, (end_y * SCALE as f64).round() as i32);
     DeleteObject(progress_pen);
 
     SetBkMode(buffer, TRANSPARENT);
     SetTextColor(buffer, rgb(243, 247, 245));
-    let font = CreateFontW(52 * SCALE, 0, 0, 0, 700, 0, 0, 0, 1, 0, 0, 5, 0, [77, 97, 110, 111, 112, 111, 108, 0].as_ptr());
+    let font = CreateFontW(51 * SCALE, 0, 0, 0, 700, 0, 0, 0, 1, 0, 0, 5, 0, [77, 97, 110, 114, 111, 112, 101, 0].as_ptr());
     SelectObject(buffer, font);
-    let mut number_rect = Rect { left: 20 * SCALE, top: 47 * SCALE, right: 154 * SCALE, bottom: 111 * SCALE };
+    let mut number_rect = Rect { left: 8 * SCALE, top: 25 * SCALE, right: 114 * SCALE, bottom: 78 * SCALE };
     let number_text: Vec<u16> = allowance.to_string().encode_utf16().collect();
     DrawTextW(buffer, number_text.as_ptr(), number_text.len() as i32, &mut number_rect, 0x00000001 | 0x00000004);
     DeleteObject(font);
 
-    let label_font = CreateFontW(13 * SCALE, 0, 0, 0, 500, 0, 0, 0, 1, 0, 0, 5, 0, [67, 111, 110, 115, 111, 108, 97, 115, 0].as_ptr());
+    let label_font = CreateFontW(14 * SCALE, 0, 0, 0, 500, 0, 0, 0, 1, 0, 0, 5, 0, [68, 77, 32, 77, 111, 110, 111, 0].as_ptr());
     SelectObject(buffer, label_font);
     SetTextColor(buffer, rgb(168, 202, 184));
-    let mut label_rect = Rect { left: 20 * SCALE, top: 108 * SCALE, right: 154 * SCALE, bottom: 137 * SCALE };
-    let reset_text: Vec<u16> = format_reset_countdown(snapshot.five_hour.resets_at)
+    let mut label_rect = Rect { left: 8 * SCALE, top: 81 * SCALE, right: 114 * SCALE, bottom: 108 * SCALE };
+    let reset_text: Vec<u16> = format_reset_duration(snapshot.five_hour.resets_at)
         .encode_utf16()
         .collect();
     DrawTextW(buffer, reset_text.as_ptr(), reset_text.len() as i32, &mut label_rect, 0x00000001 | 0x00000004);
     DeleteObject(label_font);
 
+    if hovered {
+        let panel_font = CreateFontW(25 * SCALE, 0, 0, 0, 600, 0, 0, 0, 1, 0, 0, 5, 0, [77, 97, 110, 114, 111, 112, 101, 0].as_ptr());
+        SelectObject(buffer, panel_font);
+        SetTextColor(buffer, rgb(172, 208, 188));
+        let weekly = snapshot.weekly.as_ref().map_or_else(|| "--".to_string(), |window| format!("WEEKLY  {}%", window.remaining_percent));
+        let weekly_text: Vec<u16> = weekly.encode_utf16().collect();
+        let mut weekly_rect = Rect { left: BALL_SIZE * SCALE, top: 14 * SCALE, right: (WINDOW_WIDTH - 12) * SCALE, bottom: 59 * SCALE };
+        DrawTextW(buffer, weekly_text.as_ptr(), weekly_text.len() as i32, &mut weekly_rect, 0x00000004);
+
+        let reset_text: Vec<u16> = snapshot.weekly.as_ref().map_or_else(|| "RESET IN  --".to_string(), |window| format!("RESET IN  {}", format_reset_countdown(window.resets_at))).encode_utf16().collect();
+        let mut reset_rect = Rect { left: BALL_SIZE * SCALE, top: 77 * SCALE, right: (WINDOW_WIDTH - 12) * SCALE, bottom: 122 * SCALE };
+        DrawTextW(buffer, reset_text.as_ptr(), reset_text.len() as i32, &mut reset_rect, 0x00000004);
+        DeleteObject(panel_font);
+    }
+
     SetStretchBltMode(hdc, HALFTONE);
-    StretchBlt(hdc, 0, 0, WINDOW_SIZE, WINDOW_SIZE, buffer, 0, 0, large_size, large_size, 0x00CC0020);
+    StretchBlt(hdc, 0, 0, WINDOW_WIDTH, WINDOW_HEIGHT, buffer, 0, 0, large_width, large_height, 0x00CC0020);
     SelectObject(buffer, previous_bitmap);
     DeleteObject(bitmap);
     DeleteDC(buffer);
@@ -219,11 +283,10 @@ pub fn run() {
         let instance = GetModuleHandleW(null());
         let class = WndClass { style: 0, window_proc, class_extra: 0, window_extra: 0, instance, icon: null_mut(), cursor: null_mut(), background: null_mut(), menu_name: null(), class_name: CLASS_NAME.as_ptr() };
         RegisterClassW(&class);
-        let size = WINDOW_SIZE;
-        let x = (GetSystemMetrics(SM_CXSCREEN) - size) / 2;
-        let y = (GetSystemMetrics(SM_CYSCREEN) - size) / 2;
-        let hwnd = CreateWindowExW(WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE, CLASS_NAME.as_ptr(), WINDOW_TITLE.as_ptr(), WS_POPUP, x, y, size, size, null_mut(), null_mut(), instance, null_mut());
-        SetWindowRgn(hwnd, CreateEllipticRgn(0, 0, size, size), 1);
+        let x = (GetSystemMetrics(SM_CXSCREEN) - BALL_SIZE) / 2;
+        let y = (GetSystemMetrics(SM_CYSCREEN) - WINDOW_HEIGHT) / 2;
+        let hwnd = CreateWindowExW(WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE, CLASS_NAME.as_ptr(), WINDOW_TITLE.as_ptr(), WS_POPUP, x, y, WINDOW_WIDTH, WINDOW_HEIGHT, null_mut(), null_mut(), instance, null_mut());
+        set_window_region(hwnd, false);
         SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
         ShowWindow(hwnd, SW_SHOWNOACTIVATE);
         let mut message = Msg { hwnd: null_mut(), message: 0, w_param: 0, l_param: 0, time: 0, point: Point { x: 0, y: 0 } };
@@ -314,13 +377,38 @@ fn format_reset_countdown(resets_at: Option<i64>) -> String {
         .duration_since(UNIX_EPOCH)
         .map_or(0, |duration| duration.as_secs() as i64);
     let seconds = (resets_at - now).max(0);
+    format_reset_seconds(seconds)
+}
+
+fn format_reset_duration(resets_at: Option<i64>) -> String {
+    let Some(resets_at) = resets_at else {
+        return "--".to_string();
+    };
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_secs() as i64);
+    let seconds = (resets_at - now).max(0);
+    format_duration_seconds(seconds)
+}
+
+fn format_reset_seconds(seconds: i64) -> String {
     if seconds == 0 {
         return "now".to_string();
     }
-    if seconds >= 3600 {
-        return format!("{}h {:02}m", seconds / 3600, (seconds % 3600) / 60);
+    if seconds >= 86_400 {
+        return format!("{}d", seconds / 86_400);
+    }
+    if seconds >= 3_600 {
+        return format!("{}h", seconds / 3_600);
     }
     format!("{}m", (seconds / 60).max(1))
+}
+
+fn format_duration_seconds(seconds: i64) -> String {
+    if seconds == 0 {
+        return "now".to_string();
+    }
+    format!("{}h {:02}m", seconds / 3_600, (seconds % 3_600) / 60)
 }
 
 fn parse_allowance_snapshot(limits: &Value) -> Result<AllowanceSnapshot, String> {
@@ -432,7 +520,7 @@ fn write_message(stdin: &mut ChildStdin, message: &Value) -> Result<(), String> 
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_allowance_snapshot, AllowanceSnapshot, QuotaWindow};
+    use super::{format_duration_seconds, format_reset_seconds, parse_allowance_snapshot, AllowanceSnapshot, QuotaWindow};
     use serde_json::json;
 
     #[test]
@@ -490,5 +578,18 @@ mod tests {
                 weekly: None,
             }
         );
+    }
+
+    #[test]
+    fn formats_only_the_largest_countdown_unit() {
+        assert_eq!(format_reset_seconds(2 * 86_400 + 3_600), "2d");
+        assert_eq!(format_reset_seconds(5 * 3_600 + 30 * 60), "5h");
+        assert_eq!(format_reset_seconds(45 * 60 + 20), "45m");
+    }
+
+    #[test]
+    fn formats_five_hour_countdown_with_hours_and_minutes() {
+        assert_eq!(format_duration_seconds(5 * 3_600 + 3 * 60), "5h 03m");
+        assert_eq!(format_duration_seconds(45 * 60), "0h 45m");
     }
 }
