@@ -14,7 +14,7 @@ if errorlevel 1 goto copy_failed
 echo.
 echo Build completed successfully.
 echo Output: %CD%\artifacts\codex-status-ball.exe
-pause
+
 exit /b 0
 
 :build_failed
